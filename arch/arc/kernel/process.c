@@ -116,17 +116,6 @@ void arch_cpu_idle(void)
 		:"I"(arg)); /* can't be "r" has to be embedded const */
 }
 
-#elif defined(CONFIG_EZNPS_MTM_EXT)	/* ARC700 variant in NPS */
-
-void arch_cpu_idle(void)
-{
-	/* only the calling HW thread needs to sleep */
-	__asm__ __volatile__(
-		".word %0	\n"
-		:
-		:"i"(CTOP_INST_HWSCHD_WFT_IE12));
-}
-
 #else	/* ARC700 */
 
 void arch_cpu_idle(void)
@@ -202,7 +191,7 @@ int copy_thread(unsigned long clone_flags, unsigned long usp,
 	childksp[0] = 0;			/* fp */
 	childksp[1] = (unsigned long)ret_from_fork; /* blink */
 
-	if (unlikely(p->flags & PF_KTHREAD)) {
+	if (unlikely(p->flags & (PF_KTHREAD | PF_IO_WORKER))) {
 		memset(c_regs, 0, sizeof(struct pt_regs));
 
 		c_callee->r13 = kthread_arg;
@@ -277,10 +266,6 @@ void start_thread(struct pt_regs *regs, unsigned long pc, unsigned long usp)
 	 * Interrupts enabled
 	 */
 	regs->status32 = STATUS_U_MASK | STATUS_L_MASK | ISA_INIT_STATUS_BITS;
-
-#ifdef CONFIG_EZNPS_MTM_EXT
-	regs->eflags = 0;
-#endif
 
 	fpu_init_task(regs);
 

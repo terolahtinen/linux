@@ -16,7 +16,6 @@
 #include <linux/interrupt.h>
 #include <linux/spi/spi.h>
 #include <linux/slab.h>
-#include <linux/platform_data/dma-atmel.h>
 #include <linux/of.h>
 
 #include <linux/io.h>
@@ -513,8 +512,8 @@ static int atmel_spi_configure_dma(struct spi_master *master,
 
 	master->dma_tx = dma_request_chan(dev, "tx");
 	if (IS_ERR(master->dma_tx)) {
-		err = dev_err_probe(dev, PTR_ERR(master->dma_tx),
-				    "No TX DMA channel, DMA is disabled\n");
+		err = PTR_ERR(master->dma_tx);
+		dev_dbg(dev, "No TX DMA channel, DMA is disabled\n");
 		goto error_clear;
 	}
 
@@ -525,7 +524,7 @@ static int atmel_spi_configure_dma(struct spi_master *master,
 		 * No reason to check EPROBE_DEFER here since we have already
 		 * requested tx channel.
 		 */
-		dev_err(dev, "No RX DMA channel, DMA is disabled\n");
+		dev_dbg(dev, "No RX DMA channel, DMA is disabled\n");
 		goto error;
 	}
 
@@ -1591,7 +1590,7 @@ static int atmel_spi_probe(struct platform_device *pdev)
 		if (ret == 0) {
 			as->use_dma = true;
 		} else if (ret == -EPROBE_DEFER) {
-			return ret;
+			goto out_unmap_regs;
 		}
 	} else if (as->caps.has_pdc_support) {
 		as->use_pdc = true;

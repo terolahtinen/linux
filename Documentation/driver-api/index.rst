@@ -27,14 +27,15 @@ available subsections can be seen below.
    component
    message-based
    infiniband
-   sound
    frame-buffer
    regulator
+   reset
    iio/index
    input
    usb/index
    firewire
    pci/index
+   cxl/index
    spi
    i2c
    ipmb
@@ -73,12 +74,12 @@ available subsections can be seen below.
    thermal/index
    fpga/index
    acpi/index
+   auxiliary_bus
    backlight/lp855x-driver.rst
    connector
    console
    dcdbas
    eisa
-   ipmb
    isa
    isapnp
    io-mapping
@@ -93,12 +94,12 @@ available subsections can be seen below.
    pps
    ptp
    phy/index
-   pti_intel_mid
    pwm
    pldmfw/index
    rfkill
    serial/index
    sm501
+   surface_aggregator/index
    switchtec
    sync_file
    vfio-mediated-device

@@ -8,62 +8,21 @@
 #include <asm/extable.h>
 #include <asm/kup.h>
 
-/*
- * The fs value determines whether argument validity checking should be
- * performed or not.  If get_fs() == USER_DS, checking is performed, with
- * get_fs() == KERNEL_DS, checking is bypassed.
- *
- * For historical reasons, these macros are grossly misnamed.
- *
- * The fs/ds values are now the highest legal address in the "segment".
- * This simplifies the checking in the routines below.
- */
-
-#define MAKE_MM_SEG(s)  ((mm_segment_t) { (s) })
-
-#define KERNEL_DS	MAKE_MM_SEG(~0UL)
 #ifdef __powerpc64__
 /* We use TASK_SIZE_USER64 as TASK_SIZE is not constant */
-#define USER_DS		MAKE_MM_SEG(TASK_SIZE_USER64 - 1)
+#define TASK_SIZE_MAX		TASK_SIZE_USER64
 #else
-#define USER_DS		MAKE_MM_SEG(TASK_SIZE - 1)
+#define TASK_SIZE_MAX		TASK_SIZE
 #endif
 
-#define get_fs()	(current->thread.addr_limit)
-
-static inline void set_fs(mm_segment_t fs)
+static inline bool __access_ok(unsigned long addr, unsigned long size)
 {
-	current->thread.addr_limit = fs;
-	/* On user-mode return check addr_limit (fs) is correct */
-	set_thread_flag(TIF_FSCHECK);
+	return addr < TASK_SIZE_MAX && size <= TASK_SIZE_MAX - addr;
 }
-
-#define uaccess_kernel() (get_fs().seg == KERNEL_DS.seg)
-#define user_addr_max()	(get_fs().seg)
-
-#ifdef __powerpc64__
-/*
- * This check is sufficient because there is a large enough
- * gap between user addresses and the kernel addresses
- */
-#define __access_ok(addr, size, segment)	\
-	(((addr) <= (segment).seg) && ((size) <= (segment).seg))
-
-#else
-
-static inline int __access_ok(unsigned long addr, unsigned long size,
-			mm_segment_t seg)
-{
-	if (addr > seg.seg)
-		return 0;
-	return (size == 0 || size - 1 <= seg.seg - addr);
-}
-
-#endif
 
 #define access_ok(addr, size)		\
 	(__chk_user_ptr(addr),		\
-	 __access_ok((__force unsigned long)(addr), (size), get_fs()))
+	 __access_ok((unsigned long)(addr), (size)))
 
 /*
  * These are the main single-value transfer routines.  They automatically
@@ -93,8 +52,6 @@ static inline int __access_ok(unsigned long addr, unsigned long size,
 	__get_user_nocheck((x), (ptr), sizeof(*(ptr)), true)
 #define __put_user(x, ptr) \
 	__put_user_nocheck((__typeof__(*(ptr)))(x), (ptr), sizeof(*(ptr)))
-#define __put_user_goto(x, ptr, label) \
-	__put_user_nocheck_goto((__typeof__(*(ptr)))(x), (ptr), sizeof(*(ptr)), label)
 
 #define __get_user_allowed(x, ptr) \
 	__get_user_nocheck((x), (ptr), sizeof(*(ptr)), false)
@@ -151,58 +108,18 @@ static inline int __access_ok(unsigned long addr, unsigned long size,
 
 extern long __put_user_bad(void);
 
-/*
- * We don't tell gcc that we are accessing memory, but this is OK
- * because we do not write to any memory gcc knows about, so there
- * are no aliasing issues.
- */
-#define __put_user_asm(x, addr, err, op)			\
-	__asm__ __volatile__(					\
-		"1:	" op " %1,0(%2)	# put_user\n"		\
-		"2:\n"						\
-		".section .fixup,\"ax\"\n"			\
-		"3:	li %0,%3\n"				\
-		"	b 2b\n"					\
-		".previous\n"					\
-		EX_TABLE(1b, 3b)				\
-		: "=r" (err)					\
-		: "r" (x), "b" (addr), "i" (-EFAULT), "0" (err))
-
-#ifdef __powerpc64__
-#define __put_user_asm2(x, ptr, retval)				\
-	  __put_user_asm(x, ptr, retval, "std")
-#else /* __powerpc64__ */
-#define __put_user_asm2(x, addr, err)				\
-	__asm__ __volatile__(					\
-		"1:	stw %1,0(%2)\n"				\
-		"2:	stw %1+1,4(%2)\n"			\
-		"3:\n"						\
-		".section .fixup,\"ax\"\n"			\
-		"4:	li %0,%3\n"				\
-		"	b 3b\n"					\
-		".previous\n"					\
-		EX_TABLE(1b, 4b)				\
-		EX_TABLE(2b, 4b)				\
-		: "=r" (err)					\
-		: "r" (x), "b" (addr), "i" (-EFAULT), "0" (err))
-#endif /* __powerpc64__ */
-
-#define __put_user_size_allowed(x, ptr, size, retval)		\
-do {								\
-	retval = 0;						\
-	switch (size) {						\
-	  case 1: __put_user_asm(x, ptr, retval, "stb"); break;	\
-	  case 2: __put_user_asm(x, ptr, retval, "sth"); break;	\
-	  case 4: __put_user_asm(x, ptr, retval, "stw"); break;	\
-	  case 8: __put_user_asm2(x, ptr, retval); break;	\
-	  default: __put_user_bad();				\
-	}							\
-} while (0)
-
 #define __put_user_size(x, ptr, size, retval)			\
 do {								\
+	__label__ __pu_failed;					\
+								\
+	retval = 0;						\
 	allow_write_to_user(ptr, size);				\
-	__put_user_size_allowed(x, ptr, size, retval);		\
+	__put_user_size_goto(x, ptr, size, __pu_failed);	\
+	prevent_write_to_user(ptr, size);			\
+	break;							\
+								\
+__pu_failed:							\
+	retval = -EFAULT;					\
 	prevent_write_to_user(ptr, size);			\
 } while (0)
 
@@ -249,12 +166,17 @@ do {								\
 })
 
 
+/*
+ * We don't tell gcc that we are accessing memory, but this is OK
+ * because we do not write to any memory gcc knows about, so there
+ * are no aliasing issues.
+ */
 #define __put_user_asm_goto(x, addr, label, op)			\
-	asm volatile goto(					\
+	asm_volatile_goto(					\
 		"1:	" op "%U1%X1 %0,%1	# put_user\n"	\
 		EX_TABLE(1b, %l2)				\
 		:						\
-		: "r" (x), "m" (*addr)				\
+		: "r" (x), "m"UPD_CONSTR (*addr)		\
 		:						\
 		: label)
 
@@ -263,7 +185,7 @@ do {								\
 	__put_user_asm_goto(x, ptr, label, "std")
 #else /* __powerpc64__ */
 #define __put_user_asm2_goto(x, addr, label)			\
-	asm volatile goto(					\
+	asm_volatile_goto(					\
 		"1:	stw%X1 %0, %1\n"			\
 		"2:	stw%X1 %L0, %L1\n"			\
 		EX_TABLE(1b, %l2)				\
@@ -285,11 +207,9 @@ do {								\
 	}							\
 } while (0)
 
-#define __put_user_nocheck_goto(x, ptr, size, label)		\
+#define __unsafe_put_user_goto(x, ptr, size, label)		\
 do {								\
 	__typeof__(*(ptr)) __user *__pu_addr = (ptr);		\
-	if (!is_kernel_addr((unsigned long)__pu_addr))		\
-		might_fault();					\
 	__chk_user_ptr(ptr);					\
 	__put_user_size_goto((x), __pu_addr, (size), label);	\
 } while (0)
@@ -316,7 +236,7 @@ extern long __get_user_bad(void);
 
 #define __get_user_asm(x, addr, err, op)		\
 	__asm__ __volatile__(				\
-		"1:	"op" %1,0(%2)	# get_user\n"	\
+		"1:	"op"%U2%X2 %1, %2	# get_user\n"	\
 		"2:\n"					\
 		".section .fixup,\"ax\"\n"		\
 		"3:	li %0,%3\n"			\
@@ -325,7 +245,7 @@ extern long __get_user_bad(void);
 		".previous\n"				\
 		EX_TABLE(1b, 3b)			\
 		: "=r" (err), "=r" (x)			\
-		: "b" (addr), "i" (-EFAULT), "0" (err))
+		: "m"UPD_CONSTR (*addr), "i" (-EFAULT), "0" (err))
 
 #ifdef __powerpc64__
 #define __get_user_asm2(x, addr, err)			\
@@ -333,8 +253,8 @@ extern long __get_user_bad(void);
 #else /* __powerpc64__ */
 #define __get_user_asm2(x, addr, err)			\
 	__asm__ __volatile__(				\
-		"1:	lwz %1,0(%2)\n"			\
-		"2:	lwz %1+1,4(%2)\n"		\
+		"1:	lwz%X2 %1, %2\n"			\
+		"2:	lwz%X2 %L1, %L2\n"		\
 		"3:\n"					\
 		".section .fixup,\"ax\"\n"		\
 		"4:	li %0,%3\n"			\
@@ -345,7 +265,7 @@ extern long __get_user_bad(void);
 		EX_TABLE(1b, 4b)			\
 		EX_TABLE(2b, 4b)			\
 		: "=r" (err), "=&r" (x)			\
-		: "b" (addr), "i" (-EFAULT), "0" (err))
+		: "m" (*addr), "i" (-EFAULT), "0" (err))
 #endif /* __powerpc64__ */
 
 #define __get_user_size_allowed(x, ptr, size, retval)		\
@@ -355,10 +275,10 @@ do {								\
 	if (size > sizeof(x))					\
 		(x) = __get_user_bad();				\
 	switch (size) {						\
-	case 1: __get_user_asm(x, ptr, retval, "lbz"); break;	\
-	case 2: __get_user_asm(x, ptr, retval, "lhz"); break;	\
-	case 4: __get_user_asm(x, ptr, retval, "lwz"); break;	\
-	case 8: __get_user_asm2(x, ptr, retval);  break;	\
+	case 1: __get_user_asm(x, (u8 __user *)ptr, retval, "lbz"); break;	\
+	case 2: __get_user_asm(x, (u16 __user *)ptr, retval, "lhz"); break;	\
+	case 4: __get_user_asm(x, (u32 __user *)ptr, retval, "lwz"); break;	\
+	case 8: __get_user_asm2(x, (u64 __user *)ptr, retval);  break;	\
 	default: (x) = __get_user_bad();			\
 	}							\
 } while (0)
@@ -385,9 +305,8 @@ do {								\
 	__typeof__(size) __gu_size = (size);			\
 								\
 	__chk_user_ptr(__gu_addr);				\
-	if (!is_kernel_addr((unsigned long)__gu_addr))		\
+	if (do_allow && !is_kernel_addr((unsigned long)__gu_addr)) \
 		might_fault();					\
-	barrier_nospec();					\
 	if (do_allow)								\
 		__get_user_size(__gu_val, __gu_addr, __gu_size, __gu_err);	\
 	else									\
@@ -405,10 +324,8 @@ do {								\
 	__typeof__(size) __gu_size = (size);				\
 									\
 	might_fault();							\
-	if (access_ok(__gu_addr, __gu_size)) {				\
-		barrier_nospec();					\
+	if (access_ok(__gu_addr, __gu_size))				\
 		__get_user_size(__gu_val, __gu_addr, __gu_size, __gu_err); \
-	}								\
 	(x) = (__force __typeof__(*(ptr)))__gu_val;				\
 									\
 	__gu_err;							\
@@ -422,7 +339,6 @@ do {								\
 	__typeof__(size) __gu_size = (size);			\
 								\
 	__chk_user_ptr(__gu_addr);				\
-	barrier_nospec();					\
 	__get_user_size(__gu_val, __gu_addr, __gu_size, __gu_err); \
 	(x) = (__force __typeof__(*(ptr)))__gu_val;			\
 								\
@@ -467,7 +383,6 @@ raw_copy_in_user(void __user *to, const void __user *from, unsigned long n)
 {
 	unsigned long ret;
 
-	barrier_nospec();
 	allow_read_write_user(to, from, n);
 	ret = __copy_tofrom_user(to, from, n);
 	prevent_read_write_user(to, from, n);
@@ -479,63 +394,11 @@ static inline unsigned long raw_copy_from_user(void *to,
 		const void __user *from, unsigned long n)
 {
 	unsigned long ret;
-	if (__builtin_constant_p(n) && (n <= 8)) {
-		ret = 1;
 
-		switch (n) {
-		case 1:
-			barrier_nospec();
-			__get_user_size(*(u8 *)to, from, 1, ret);
-			break;
-		case 2:
-			barrier_nospec();
-			__get_user_size(*(u16 *)to, from, 2, ret);
-			break;
-		case 4:
-			barrier_nospec();
-			__get_user_size(*(u32 *)to, from, 4, ret);
-			break;
-		case 8:
-			barrier_nospec();
-			__get_user_size(*(u64 *)to, from, 8, ret);
-			break;
-		}
-		if (ret == 0)
-			return 0;
-	}
-
-	barrier_nospec();
 	allow_read_from_user(from, n);
 	ret = __copy_tofrom_user((__force void __user *)to, from, n);
 	prevent_read_from_user(from, n);
 	return ret;
-}
-
-static inline unsigned long
-raw_copy_to_user_allowed(void __user *to, const void *from, unsigned long n)
-{
-	if (__builtin_constant_p(n) && (n <= 8)) {
-		unsigned long ret = 1;
-
-		switch (n) {
-		case 1:
-			__put_user_size_allowed(*(u8 *)from, (u8 __user *)to, 1, ret);
-			break;
-		case 2:
-			__put_user_size_allowed(*(u16 *)from, (u16 __user *)to, 2, ret);
-			break;
-		case 4:
-			__put_user_size_allowed(*(u32 *)from, (u32 __user *)to, 4, ret);
-			break;
-		case 8:
-			__put_user_size_allowed(*(u64 *)from, (u64 __user *)to, 8, ret);
-			break;
-		}
-		if (ret == 0)
-			return 0;
-	}
-
-	return __copy_tofrom_user(to, (__force const void __user *)from, n);
 }
 
 static inline unsigned long
@@ -544,7 +407,7 @@ raw_copy_to_user(void __user *to, const void *from, unsigned long n)
 	unsigned long ret;
 
 	allow_write_to_user(to, n);
-	ret = raw_copy_to_user_allowed(to, from, n);
+	ret = __copy_tofrom_user(to, (__force const void __user *)from, n);
 	prevent_write_to_user(to, n);
 	return ret;
 }
@@ -580,6 +443,9 @@ static __must_check inline bool user_access_begin(const void __user *ptr, size_t
 {
 	if (unlikely(!access_ok(ptr, len)))
 		return false;
+
+	might_fault();
+
 	allow_read_write_user((void __user *)ptr, ptr, len);
 	return true;
 }
@@ -593,6 +459,9 @@ user_read_access_begin(const void __user *ptr, size_t len)
 {
 	if (unlikely(!access_ok(ptr, len)))
 		return false;
+
+	might_fault();
+
 	allow_read_from_user(ptr, len);
 	return true;
 }
@@ -604,6 +473,9 @@ user_write_access_begin(const void __user *ptr, size_t len)
 {
 	if (unlikely(!access_ok(ptr, len)))
 		return false;
+
+	might_fault();
+
 	allow_write_to_user((void __user *)ptr, len);
 	return true;
 }
@@ -612,7 +484,8 @@ user_write_access_begin(const void __user *ptr, size_t len)
 
 #define unsafe_op_wrap(op, err) do { if (unlikely(op)) goto err; } while (0)
 #define unsafe_get_user(x, p, e) unsafe_op_wrap(__get_user_allowed(x, p), e)
-#define unsafe_put_user(x, p, e) __put_user_goto(x, p, e)
+#define unsafe_put_user(x, p, e) \
+	__unsafe_put_user_goto((__typeof__(*(p)))(x), (p), sizeof(*(p)), e)
 
 #define unsafe_copy_to_user(d, s, l, e) \
 do {									\
@@ -622,17 +495,33 @@ do {									\
 	int _i;								\
 									\
 	for (_i = 0; _i < (_len & ~(sizeof(long) - 1)); _i += sizeof(long))		\
-		__put_user_goto(*(long*)(_src + _i), (long __user *)(_dst + _i), e);\
+		unsafe_put_user(*(long*)(_src + _i), (long __user *)(_dst + _i), e); \
 	if (IS_ENABLED(CONFIG_PPC64) && (_len & 4)) {			\
-		__put_user_goto(*(u32*)(_src + _i), (u32 __user *)(_dst + _i), e);	\
+		unsafe_put_user(*(u32*)(_src + _i), (u32 __user *)(_dst + _i), e); \
 		_i += 4;						\
 	}								\
 	if (_len & 2) {							\
-		__put_user_goto(*(u16*)(_src + _i), (u16 __user *)(_dst + _i), e);	\
+		unsafe_put_user(*(u16*)(_src + _i), (u16 __user *)(_dst + _i), e); \
 		_i += 2;						\
 	}								\
 	if (_len & 1) \
-		__put_user_goto(*(u8*)(_src + _i), (u8 __user *)(_dst + _i), e);\
+		unsafe_put_user(*(u8*)(_src + _i), (u8 __user *)(_dst + _i), e); \
 } while (0)
+
+#define HAVE_GET_KERNEL_NOFAULT
+
+#define __get_kernel_nofault(dst, src, type, err_label)			\
+do {									\
+	int __kr_err;							\
+									\
+	__get_user_size_allowed(*((type *)(dst)), (__force type __user *)(src),\
+			sizeof(type), __kr_err);			\
+	if (unlikely(__kr_err))						\
+		goto err_label;						\
+} while (0)
+
+#define __put_kernel_nofault(dst, src, type, err_label)			\
+	__put_user_size_goto(*((type *)(src)),				\
+		(__force type __user *)(dst), sizeof(type), err_label)
 
 #endif	/* _ARCH_POWERPC_UACCESS_H */

@@ -4,18 +4,30 @@
 
 #include <linux/sched.h>
 #include <linux/xarray.h>
-#include <linux/percpu-refcount.h>
+
+struct io_wq_work_node {
+	struct io_wq_work_node *next;
+};
+
+struct io_wq_work_list {
+	struct io_wq_work_node *first;
+	struct io_wq_work_node *last;
+};
 
 struct io_uring_task {
 	/* submission side */
 	struct xarray		xa;
 	struct wait_queue_head	wait;
-	struct file		*last;
-	atomic_long_t		req_issue;
+	void			*last;
+	void			*io_wq;
+	struct percpu_counter	inflight;
+	atomic_t		in_idle;
+	bool			sqpoll;
 
-	/* completion side */
-	bool			in_idle ____cacheline_aligned_in_smp;
-	atomic_long_t		req_complete;
+	spinlock_t		task_lock;
+	struct io_wq_work_list	task_list;
+	unsigned long		task_state;
+	struct callback_head	task_work;
 };
 
 #if defined(CONFIG_IO_URING)
@@ -26,12 +38,12 @@ void __io_uring_free(struct task_struct *tsk);
 
 static inline void io_uring_task_cancel(void)
 {
-	if (current->io_uring && !xa_empty(&current->io_uring->xa))
+	if (current->io_uring)
 		__io_uring_task_cancel();
 }
 static inline void io_uring_files_cancel(struct files_struct *files)
 {
-	if (current->io_uring && !xa_empty(&current->io_uring->xa))
+	if (current->io_uring)
 		__io_uring_files_cancel(files);
 }
 static inline void io_uring_free(struct task_struct *tsk)
